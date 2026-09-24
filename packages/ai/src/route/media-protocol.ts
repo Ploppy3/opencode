@@ -16,17 +16,37 @@ import {
 // Bodies
 // ---------------------------------------------------------------------------
 
-/** JSON `query` is appended to the endpoint URL before the route and caller `http.query` overlays. */
-export type Body =
-  | { readonly type: "json"; readonly value: Record<string, unknown>; readonly query?: Record<string, string> }
-  | { readonly type: "multipart"; readonly value: FormData }
+/** Array values become repeated parameters (`keyterm=a&keyterm=b`). */
+export type Query = Readonly<Record<string, string | ReadonlyArray<string>>>
 
-export const json = (value: Record<string, unknown>, query?: Record<string, string>): Body => ({
+/** `query` is appended to the endpoint URL before the route and caller `http.query` overlays. */
+export type Body =
+  | { readonly type: "json"; readonly value: Record<string, unknown>; readonly query?: Query }
+  | { readonly type: "multipart"; readonly value: FormData }
+  | {
+      readonly type: "binary"
+      readonly value: Uint8Array
+      readonly contentType: string
+      readonly query?: Query
+    }
+
+export const json = (value: Record<string, unknown>, query?: Query): Body => ({
   type: "json",
   value,
   query,
 })
 export const multipart = (value: FormData): Body => ({ type: "multipart", value })
+export const binary = (value: Uint8Array, contentType: string, query?: Query): Body => ({
+  type: "binary",
+  value,
+  contentType,
+  query,
+})
+
+export type Send = (path: string, body: Body) => Effect.Effect<HttpClientResponse.HttpClientResponse, AIError>
+
+/** Runs after unsupported-field rejection and before `body.from`, for providers that need an upload first. */
+export type Prepare<Request> = (request: Request, send: Send) => Effect.Effect<Request, AIError>
 
 // ---------------------------------------------------------------------------
 // Protocol kinds
@@ -68,11 +88,13 @@ export interface Started<Token> {
 
 /**
  * A follow-up call's inputs: the decoded token and the auth headers the route sent, so a protocol can attach them
- * to output URLs that require the same credentials to download (Veo).
+ * to output URLs that require the same credentials to download (Veo). `materialize` downloads an output through the
+ * route's executor, for URLs that expire too soon to hand back (BFL).
  */
 export interface PollContext<Token> {
   readonly token: Token
   readonly auth: Record<string, string>
+  readonly materialize: (asset: Media.Asset) => Effect.Effect<Media.Asset, AIError>
 }
 
 /**
@@ -91,6 +113,7 @@ export interface Queued<Request, Response, Token> {
   /** Serializable handle. `Generation.token` carries the encoded form so it can be persisted and resumed elsewhere. */
   readonly token: Schema.Codec<Token, unknown>
   readonly start: {
+    readonly prepare?: Prepare<Request>
     readonly body: { readonly from: (request: Request) => Effect.Effect<Body, AIError> }
     readonly decode: (
       response: HttpClientResponse.HttpClientResponse,

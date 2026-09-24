@@ -2,10 +2,17 @@ import { Effect, Schema, Stream } from "effect"
 import { Headers, HttpClientRequest, type HttpClientResponse } from "effect/unstable/http"
 import { Auth, type AuthInput } from "./auth.js"
 import { Endpoint } from "./endpoint.js"
-import type { Interface } from "./executor-service.js"
+import { Service as RequestExecutorService, type Interface } from "./executor-service.js"
 import { RequestExecutor } from "./executor.js"
 import { MediaProtocol } from "./media-protocol.js"
-import { Generation, type Route as GenerationRoute } from "../generation.js"
+import {
+  Generation,
+  resultEvents,
+  type AwaitOptions,
+  type Observation,
+  type Route as GenerationRoute,
+} from "../generation.js"
+import type { Media } from "../media.js"
 import { ProviderShared } from "../protocols/shared.js"
 import {
   AIError,
@@ -40,6 +47,7 @@ export interface ModelInput {
 
 /** One request, one response. */
 export interface Route<Request extends MediaRequest, Response> {
+  readonly kind: "inline"
   readonly id: string
   readonly provider: ProviderID
   readonly protocol: string
@@ -48,6 +56,7 @@ export interface Route<Request extends MediaRequest, Response> {
 
 /** Submit, then poll through the returned `Generation`. */
 export interface QueuedRoute<Request extends MediaRequest, Response> {
+  readonly kind: "queued"
   readonly id: string
   readonly provider: ProviderID
   readonly protocol: string
@@ -62,12 +71,18 @@ export interface QueuedRoute<Request extends MediaRequest, Response> {
 
 /** One request whose response parses into events; `generate` runs the same stream and collects it. */
 export interface StreamRoute<Request extends MediaRequest, Event, Response> {
+  readonly kind: "stream"
   readonly id: string
   readonly provider: ProviderID
   readonly protocol: string
   readonly stream: (request: Request, execute: Execute) => Stream.Stream<Event, AIError>
   readonly generate: (request: Request, execute: Execute) => Effect.Effect<Response, AIError>
 }
+
+export type AnyRoute<Request extends MediaRequest, Event, Response> =
+  | Route<Request, Response>
+  | StreamRoute<Request, Event, Response>
+  | QueuedRoute<Request, Response>
 
 export interface Composition<Request extends MediaRequest> {
   readonly id: string
@@ -95,14 +110,15 @@ export interface StreamInput<Request extends MediaRequest, Event, Response, Fram
 /**
  * Compose an inline media protocol with an endpoint and auth into a runnable route. The route owns the transport
  * plumbing every media protocol would otherwise duplicate: option merging, surrogate sanitizing, unsupported-field
- * rejection, URL and query rendering, auth headers, JSON vs multipart encoding, and handing responses back to the
- * protocol.
+ * rejection, URL and query rendering, auth headers, JSON, multipart, or binary encoding, and handing responses back
+ * to the protocol.
  */
 export const inline = <Request extends MediaRequest, Response>(
   input: InlineInput<Request, Response>,
 ): Route<Request, Response> => {
   const transport = makeTransport(input)
   return {
+    kind: "inline",
     id: input.id,
     provider: transport.provider,
     protocol: input.protocol.id,
@@ -132,6 +148,8 @@ export const queued = <Request extends MediaRequest, Response, Token>(
   const encodeToken = Schema.encodeSync(protocol.token)
 
   const generationRoute = (token: Token, http: HttpOptions | undefined, execute: Execute) => {
+    const materialize = (asset: Media.Asset) =>
+      asset.materialize().pipe(Effect.provideService(RequestExecutorService, { execute }))
     const poll = <A>(operation: {
       readonly path: (token: Token) => string
       readonly decode: (
@@ -141,7 +159,7 @@ export const queued = <Request extends MediaRequest, Response, Token>(
     }) =>
       transport
         .call("GET", operation.path(token), http, execute)
-        .pipe(Effect.flatMap((sent) => operation.decode(sent.response, { token, auth: sent.auth })))
+        .pipe(Effect.flatMap((sent) => operation.decode(sent.response, { token, auth: sent.auth, materialize })))
     const cancel = protocol.cancel
     const route: GenerationRoute<Response> = {
       status: poll(protocol.status),
@@ -157,7 +175,7 @@ export const queued = <Request extends MediaRequest, Response, Token>(
   const start = Effect.fn("MediaRoute.start")(function* (request: Request, execute: Execute) {
     const submitted = yield* transport.submit(
       request,
-      { unsupported: protocol.unsupported, from: protocol.start.body.from },
+      { unsupported: protocol.unsupported, prepare: protocol.start.prepare, from: protocol.start.body.from },
       execute,
     )
     const started = yield* protocol.start.decode(submitted.response, submitted.context)
@@ -185,7 +203,7 @@ export const queued = <Request extends MediaRequest, Response, Token>(
     return new Generation(route, encodeToken(token), yield* route.status)
   })
 
-  return { id: input.id, provider: transport.provider, protocol: protocol.id, start, resume }
+  return { kind: "queued", id: input.id, provider: transport.provider, protocol: protocol.id, start, resume }
 }
 
 /** Compose a streaming media protocol; `generate` runs the same stream in `generate` mode and folds it with `collect`. */
@@ -236,12 +254,64 @@ export const stream = <Request extends MediaRequest, Event, Response, Frame, Sta
       }),
     )
   return {
+    kind: "stream",
     id: input.id,
     provider: transport.provider,
     protocol: protocol.id,
     stream: (request, execute) => events(request, execute, "stream"),
     generate: (request, execute) =>
       events(request, execute, "generate").pipe(Stream.runCollect, Effect.flatMap(input.collect)),
+  }
+}
+
+export const dispatch = <Event, Response>(input: {
+  readonly modality: string
+  readonly execute: Execute
+  readonly responseEvents: (response: Response) => ReadonlyArray<Event>
+}) => {
+  const notQueued = (route: { readonly provider: ProviderID; readonly id: string }, operation: string) =>
+    ProviderShared.unsupportedOperation({
+      operation: `${input.modality}.${operation}`,
+      provider: route.provider,
+      route: route.id,
+      message: `${route.provider}/${route.id} is not a queued route; use generate or stream`,
+    })
+  const start = <Request extends MediaRequest>(route: AnyRoute<Request, Event, Response>, request: Request) => {
+    if (route.kind !== "queued") return Effect.fail(notQueued(route, "start"))
+    return route.start(request, input.execute)
+  }
+  return {
+    start,
+    resume: <Request extends MediaRequest>(
+      route: AnyRoute<Request, Event, Response>,
+      model: MediaRequest["model"],
+      token: unknown,
+    ) => {
+      if (route.kind !== "queued") return Effect.fail(notQueued(route, "resume"))
+      return route.resume(model, token, input.execute)
+    },
+    generate: <Request extends MediaRequest>(
+      route: AnyRoute<Request, Event, Response>,
+      request: Request,
+      options?: AwaitOptions,
+    ) => {
+      if (route.kind !== "queued") return route.generate(request, input.execute)
+      return start(route, request).pipe(Effect.flatMap((generation) => generation.await(options)))
+    },
+    stream: <Request extends MediaRequest>(
+      route: AnyRoute<Request, Event, Response>,
+      request: Request,
+      options?: AwaitOptions,
+    ): Stream.Stream<Event | Observation, AIError> => {
+      if (route.kind === "stream") return route.stream(request, input.execute)
+      if (route.kind === "queued")
+        return Stream.unwrap(
+          start(route, request).pipe(
+            Effect.map((generation) => resultEvents(generation, input.responseEvents, options)),
+          ),
+        )
+      return Stream.fromIterableEffect(Effect.map(route.generate(request, input.execute), input.responseEvents))
+    },
   }
 }
 
@@ -253,10 +323,32 @@ const makeTransport = <Request extends MediaRequest>(input: Composition<Request>
   const provider = ProviderID.make(input.provider)
   const routeHttp = input.headers === undefined ? undefined : new HttpOptions({ headers: input.headers })
   const authorize = Auth.toEffect(input.auth)
-  const withQuery = (url: URL, query: Record<string, string> | undefined) => {
-    for (const [key, value] of Object.entries(query ?? {})) url.searchParams.set(key, value)
-    return url
-  }
+  const baseURL = (path: string) => new URL(`${ProviderShared.trimBaseUrl(input.endpoint.baseURL ?? "")}${path}`)
+  /** `auth` is only what `Auth` added, never deployment headers. */
+  const send = Effect.fn("MediaRoute.send")(function* (
+    call: {
+      readonly method: AuthInput["method"]
+      readonly url: URL
+      readonly headers: Headers.Headers
+      readonly request: AuthInput["request"]
+      readonly body?: MediaProtocol.Body
+    },
+    execute: Execute,
+  ) {
+    const encoded = encode(call.body, call.headers)
+    const url = call.url.toString()
+    const headers = yield* authorize({
+      request: call.request,
+      method: call.method,
+      url,
+      body: encoded.text,
+      headers: encoded.headers,
+    })
+    const response = yield* execute(
+      encoded.apply(HttpClientRequest.make(call.method)(url).pipe(HttpClientRequest.setHeaders(headers))),
+    )
+    return { response, auth: Object.fromEntries(Object.entries(headers).filter(([key]) => !(key in call.headers))) }
+  })
   return {
     provider,
     /** Route and model overlays; `start` additionally merges the request's own `http`. */
@@ -266,67 +358,70 @@ const makeTransport = <Request extends MediaRequest>(input: Composition<Request>
       request: Request,
       protocol: {
         readonly unsupported?: ReadonlyArray<keyof Request & string>
+        readonly prepare?: MediaProtocol.Prepare<Request>
         readonly from: (request: Request) => Effect.Effect<MediaProtocol.Body, AIError>
       },
       execute: Execute,
     ) {
       yield* rejectUnsupported(input.id, provider, request, protocol.unsupported)
       const http = mergeHttpOptions(routeHttp, request.model.http, request.http)
+      const headers = Headers.fromInput(http?.headers)
+      const prepared =
+        protocol.prepare === undefined
+          ? request
+          : yield* protocol.prepare(request, (path, body) =>
+              send({ method: "POST", url: baseURL(path), headers, request, body }, execute).pipe(
+                Effect.map((sent) => sent.response),
+              ),
+            )
       // Sanitize after merging so model-level overlays are covered; the model value is restored, not sanitized.
-      const resolved: Request = { ...sanitizeSurrogates({ ...request, http }), model: request.model }
+      const resolved: Request = { ...sanitizeSurrogates({ ...prepared, http }), model: request.model }
       const body = yield* protocol.from(resolved)
       const url = withQuery(
         withQuery(
           Endpoint.render(input.endpoint, { request: resolved, body }),
-          body.type === "json" ? body.query : undefined,
+          body.type === "multipart" ? undefined : body.query,
         ),
         http?.query,
       )
-      const encoded = body.type === "json" ? ProviderShared.encodeJson(body.value) : "[multipart/form-data]"
-      const baseHeaders = Headers.fromInput(http?.headers)
-      const headers = yield* authorize({
-        request: resolved,
-        method: "POST",
-        url: url.toString(),
-        body: encoded,
-        // The HTTP client sets the multipart boundary; a caller-supplied content-type would corrupt it.
-        headers: body.type === "multipart" ? Headers.remove(baseHeaders, "content-type") : baseHeaders,
-      })
-      const transport = HttpClientRequest.post(url.toString()).pipe(
-        HttpClientRequest.setHeaders(headers),
-        body.type === "json"
-          ? HttpClientRequest.bodyText(encoded, "application/json")
-          : HttpClientRequest.bodyFormData(body.value),
-      )
-      const response = yield* execute(transport)
-      return { response, context: { request: resolved, body } }
+      const sent = yield* send({ method: "POST", url, headers, request: resolved, body }, execute)
+      return { response: sent.response, context: { request: resolved, body } }
     }),
-    /**
-     * Bodiless follow-up call (status, result, cancel) with the same auth and headers as `submit`. `auth` is only
-     * what `Auth` added, so protocols can hand download credentials to output assets without deployment headers.
-     */
-    call: Effect.fn("MediaRoute.call")(function* (
-      method: AuthInput["method"],
-      path: string,
-      http: HttpOptions | undefined,
-      execute: Execute,
-    ) {
+    /** Bodiless follow-up call (status, result, cancel) with the same auth and headers as `submit`. */
+    call: (method: AuthInput["method"], path: string, http: HttpOptions | undefined, execute: Execute) => {
       // Provider-issued absolute URLs (fal `status_url`) are used as-is; everything else resolves against the base.
-      const url = withQuery(
-        /^https?:\/\//.test(path)
-          ? new URL(path)
-          : new URL(`${ProviderShared.trimBaseUrl(input.endpoint.baseURL ?? "")}${path}`),
-        http?.query,
-      )
+      const url = withQuery(/^https?:\/\//.test(path) ? new URL(path) : baseURL(path), http?.query)
       for (const [key, value] of Object.entries(input.endpoint.query ?? {})) url.searchParams.set(key, value)
-      const base = Headers.fromInput(http?.headers)
-      const headers = yield* authorize({ request: { http }, method, url: url.toString(), body: "", headers: base })
-      const response = yield* execute(
-        HttpClientRequest.make(method)(url.toString()).pipe(HttpClientRequest.setHeaders(headers)),
-      )
-      const auth = Object.fromEntries(Object.entries(headers).filter(([key]) => !(key in base)))
-      return { response, auth }
-    }),
+      return send({ method, url, headers: Headers.fromInput(http?.headers), request: { http } }, execute)
+    },
+  }
+}
+
+const withQuery = (url: URL, query: MediaProtocol.Query | undefined) => {
+  for (const [key, value] of Object.entries(query ?? {})) {
+    url.searchParams.delete(key)
+    for (const item of typeof value === "string" ? [value] : value) url.searchParams.append(key, item)
+  }
+  return url
+}
+
+const encode = (body: MediaProtocol.Body | undefined, headers: Headers.Headers) => {
+  if (body === undefined) return { text: "", headers, apply: (request: HttpClientRequest.HttpClientRequest) => request }
+  if (body.type === "json") {
+    const text = ProviderShared.encodeJson(body.value)
+    return { text, headers, apply: HttpClientRequest.bodyText(text, "application/json") }
+  }
+  if (body.type === "binary")
+    return {
+      text: `[${body.contentType}]`,
+      headers,
+      apply: HttpClientRequest.bodyUint8Array(body.value, body.contentType),
+    }
+  return {
+    text: "[multipart/form-data]",
+    // The HTTP client sets the multipart boundary; a caller-supplied content-type would corrupt it.
+    headers: Headers.remove(headers, "content-type"),
+    apply: HttpClientRequest.bodyFormData(body.value),
   }
 }
 
